@@ -189,6 +189,71 @@ g = Guardian(model, optimizer, scheduler, snapshot_every=50, adaptive_clip=True)
 # in your loop: loss.backward(); if g.pre_step(step, batch_id): optimizer.step(); d = g.post_step(step, loss, batch_id)
 ```
 
+## silent_bug_agent: runtime hooks for the Runtime Monitor Agent
+
+`silent_bug_agent.runtime.hooks` is the perception layer for an agent that watches training live. It attaches hooks to an existing model and optimizer, with no change to the model's code, and publishes one `TrainingState` snapshot per monitored step:
+
+| captured | how |
+|---|---|
+| activation distributions per layer | forward hooks: mean, std, min, max, mean \|x\|, fraction zero, fraction saturated, norm, NaN/Inf count, optional histogram |
+| gradients per layer | hooks on each layer's output tensor: norm, mean \|g\|, max \|g\|, NaN/Inf count |
+| gradient norms, weight norms, weight deltas per parameter | optimizer step pre/post hooks |
+| loss dynamics | `backward()` wrapper; EMA z-score spike tracking |
+
+Each snapshot also carries the learning rates, global norms, the update ratio and a list of `anomalies`:
+
+- `nonfinite_loss`, `nonfinite_activation`, `nonfinite_gradient`, `nonfinite_activation_grad`
+- `dead_units`, `saturated_units`
+- `loss_spike`, `grad_norm_spike`
+- `update_too_large`, `no_update`
+- `eval_mode_training`
+
+```python
+from silent_bug_agent.runtime import RuntimeHooks, HookConfig
+
+hooks = RuntimeHooks(model, optimizer, HookConfig(every_n_steps=10)).attach()
+# ... the training loop stays exactly as it is ...
+state = hooks.latest                    # newest TrainingState
+for state in hooks.stream:              # or consume from an agent thread (blocks until the next snapshot)
+    print(state.summary(), [a.code for a in state.anomalies])
+hooks.detach()                          # removes every hook
+```
+
+How the overhead stays low:
+
+- Statistics are computed on the tensor's own device from views. Activations are never copied or moved.
+- Tensors larger than 65,536 elements are sampled with a strided view. One full reduction still catches any NaN/Inf.
+- Hooks never synchronise with the GPU. Each monitored step makes one small asynchronous device-to-host copy into reused pinned buffers.
+- The only extra copy is a strided sample of each weight tensor, taken before `optimizer.step()` into a buffer that is allocated once.
+- `SnapshotStream` is a bounded ring buffer that never blocks training. If a consumer falls behind, the oldest snapshots are dropped and counted.
+
+Without an optimizer hook (manual updates), call `hooks.end_step()` after each step.
+
+**Validation:**
+
+```bash
+silent-bug-agent-validate --steps 20          # or: python -m silent_bug_agent.runtime.validate --device cuda
+```
+
+It runs seven architectures: MLP, ResNet with in-place ReLU, LSTM, GRU, Transformer encoder, GPT-style causal decoder with `nn.MultiheadAttention`, and a tanh/sigmoid autoencoder. For each one it checks that:
+
+- training is **bit-identical** with and without hooks;
+- loss, gradient norm and weight delta match an independent measurement every step;
+- every selected layer reports activation and gradient statistics;
+- `detach()` leaves no hook behind.
+
+It then injects six faults (NaN input, dead ReLUs, saturated tanh, ×1e4 learning rate, training in eval mode, a loss spike) and checks that each raises its anomaly. It also checks that a clean run raises none, that an agent thread receives every snapshot, and that a `torch.compile`d model still produces snapshots. All checks pass on CPU. CUDA is supported but has not been run yet.
+
+Measured overhead per training step on CPU (4 threads):
+
+| model | monitor every step | every 10th step |
+|---|---|---|
+| CNN, 7 conv layers × 64 channels, 32×32, batch 64 (440 ms/step) | 1.12× | 1.00× |
+| MLP 784-2048-2048-10, batch 256 (11 ms/step) | 1.85× | 1.00× |
+| the validation's toy models (sub-millisecond steps) | 1.3–5× | — |
+
+For long runs use `every_n_steps` of 10 or more.
+
 ## Benchmark: do no harm
 
 ```bash
